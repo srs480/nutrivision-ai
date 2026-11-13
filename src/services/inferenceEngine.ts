@@ -11,6 +11,8 @@ import { applyNonMaxSuppression, decodeYoloV8Output } from '../utils/nms';
 // Configure WASM runtime binary delivery via CDN matching the exact installed onnxruntime-web version
 ort.env.wasm.wasmPaths =
   'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/';
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
 ort.env.wasm.simd = true;
 
