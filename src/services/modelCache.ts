@@ -1,6 +1,6 @@
-const DB_NAME = 'NutriVisionModelCacheDB';
-const STORE_NAME = 'onnx_models';
-const DB_VERSION = 1;
+const DB_NAME = 'NutriVisionModelCacheDB_v2';
+const STORE_NAME = 'onnx_models_v2';
+const DB_VERSION = 2;
 
 function openCacheDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -54,7 +54,7 @@ export async function saveCachedModelBuffer(
       req.onerror = () => reject(req.error);
     });
   } catch {
-    // Non-fatal if browser storage quota is exceeded or private browsing restricts IDB
+    // Non-fatal if storage quota is exceeded
   }
 }
 
