@@ -1,0 +1,31 @@
+# Dataset configuration for fine-tuning YOLOv8 on Bangladeshi & Global 20-Class Food Dataset
+# Usage:
+#   yolo detect train data=ml/food20_dataset.yaml model=yolov8n.pt epochs=50 imgsz=640
+#   yolo export model=runs/detect/train/weights/best.pt format=onnx opset=12 imgsz=640
+
+path: ./datasets/food20
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: Rice
+  1: Fried Chicken
+  2: Chicken Curry
+  3: Beef
+  4: Fish
+  5: Egg
+  6: Dal (Lentil Soup)
+  7: Mixed Vegetables
+  8: Bread / Naan
+  9: Pizza
+  10: Burger
+  11: Pasta
+  12: Salad
+  13: Fruits
+  14: Soup
+  15: Biryani
+  16: Samosa / Snack
+  17: French Fries / Potato
+  18: Cake / Dessert
+  19: Beverage / Drink
