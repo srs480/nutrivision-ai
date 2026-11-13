@@ -13,8 +13,6 @@ ort.env.wasm.wasmPaths =
   'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/';
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.simd = true;
-ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-ort.env.wasm.simd = true;
 
 export interface InferenceResult {
   rawUnfilteredCount: number;
@@ -45,14 +43,22 @@ class FoodInferenceEngine {
   }
 
   /**
-   * Validates whether an ArrayBuffer starts with a valid protobuf/ONNX binary header
-   * rather than an HTML 404 fallback page returned by a SPA server.
+   * Validates whether an ArrayBuffer is a genuine ONNX protobuf binary
+   * rather than an HTML 404 fallback page or JSON error response.
    */
   private isValidOnnxBuffer(buffer: ArrayBuffer): boolean {
-    if (buffer.byteLength < 1024) return false;
-    const headerBytes = new Uint8Array(buffer, 0, 15);
-    const textPrefix = new TextDecoder().decode(headerBytes).trim().toLowerCase();
-    if (textPrefix.startsWith('<!doctype') || textPrefix.startsWith('<html')) {
+    if (buffer.byteLength < 100000) return false; // YOLOv8n is ~12MB; anything <100KB is invalid
+    const headerBytes = new Uint8Array(buffer, 0, 32);
+    const textPrefix = new TextDecoder()
+      .decode(headerBytes)
+      .trim()
+      .toLowerCase();
+    if (
+      textPrefix.startsWith('<!doctype') ||
+      textPrefix.startsWith('<html') ||
+      textPrefix.startsWith('{') ||
+      textPrefix.startsWith('version https://git-lfs')
+    ) {
       return false;
     }
     return true;
@@ -68,8 +74,8 @@ class FoodInferenceEngine {
     }
 
     const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('text/html')) {
-      throw new Error(`URL ${url} returned HTML instead of an ONNX binary.`);
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      throw new Error(`URL ${url} did not return a binary ONNX file.`);
     }
 
     const contentLength = Number(response.headers.get('content-length') || 0);
@@ -116,12 +122,6 @@ class FoodInferenceEngine {
     return buffer;
   }
 
-  /**
-   * Loads an ONNX model from:
-   * 1. Browser IndexedDB cache (instantaneous on repeat visits)
-   * 2. Local `/models/...` static path
-   * 3. Configured open-source static weight fallback mirrors
-   */
   public async loadModelProfile(
     profile: ModelProfile,
     onProgress?: (stage: string, pct: number) => void
@@ -150,7 +150,9 @@ class FoodInferenceEngine {
               Math.max(20, Math.min(85, pct))
             );
           });
-          loadedSource = url.startsWith('/') ? `Local Asset (${url})` : 'Public ONNX Mirror';
+          loadedSource = url.startsWith('/')
+            ? `Local Asset (${url})`
+            : 'Public ONNX Mirror';
           break;
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -161,7 +163,7 @@ class FoodInferenceEngine {
         throw new Error(
           `Could not load ONNX model "${profile.name}". ${
             lastError?.message || ''
-          } You can either run "python ml/export_model.py" to place the model in public/models/ or click "Upload Custom .onnx" in the toolbar.`
+          }`
         );
       }
 
@@ -170,7 +172,7 @@ class FoodInferenceEngine {
     }
 
     onProgress?.('Initializing ONNX Runtime Web session...', 92);
-    const { session, backend } = await this.createSessionWithFallback(modelBuffer);
+    const { session, backend } = await this.createSessionSafely(modelBuffer);
 
     this.session = session;
     this.activeProfileId = profile.id;
@@ -180,9 +182,6 @@ class FoodInferenceEngine {
     return { backend, source: loadedSource };
   }
 
-  /**
-   * Allows a user to load a custom `.onnx` file directly from their computer disk.
-   */
   public async loadCustomOnnxFile(
     file: File,
     profileId: string
@@ -192,7 +191,7 @@ class FoodInferenceEngine {
       throw new Error('Selected file is not a valid ONNX model binary.');
     }
 
-    const { session, backend } = await this.createSessionWithFallback(buffer);
+    const { session, backend } = await this.createSessionSafely(buffer);
     this.session = session;
     this.activeProfileId = profileId;
     this.activeBackend = backend;
@@ -203,38 +202,22 @@ class FoodInferenceEngine {
   }
 
   /**
-   * Attempts WebGPU execution provider first when supported by the browser,
-   * gracefully falling back to WebAssembly (WASM) SIMD.
+   * Passes a clean Uint8Array copy to ONNX Runtime Web using the stable WASM SIMD backend
+   * to prevent protobuf/tensor `t.getValue is not a function` errors across browsers.
    */
-  private async createSessionWithFallback(
+  private async createSessionSafely(
     modelBuffer: ArrayBuffer
   ): Promise<{ session: ort.InferenceSession; backend: 'webgpu' | 'wasm' }> {
-    const hasWebGpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    const modelBytes = new Uint8Array(modelBuffer.slice(0));
 
-    if (hasWebGpu) {
-      try {
-        const session = await ort.InferenceSession.create(modelBuffer.slice(0), {
-          executionProviders: ['webgpu'],
-          graphOptimizationLevel: 'all',
-        });
-        return { session, backend: 'webgpu' };
-      } catch {
-        // WebGPU failed or unsupported op; fall back to WASM
-      }
-    }
-
-    const session = await ort.InferenceSession.create(modelBuffer.slice(0), {
+    const session = await ort.InferenceSession.create(modelBytes, {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
     });
+
     return { session, backend: 'wasm' };
   }
 
-  /**
-   * Executes full image preprocessing + neural network forward pass, caching the raw
-   * output tensor so subsequent confidence/IoU slider adjustments happen in <2ms
-   * without re-running the neural network.
-   */
   public async runInference(
     image: HTMLImageElement,
     profile: ModelProfile,
@@ -271,7 +254,17 @@ class FoodInferenceEngine {
       throw new Error('Model returned an empty output tensor.');
     }
 
-    const rawData = outputTensor.data as Float32Array;
+    // Safely extract tensor data across both sync and async ONNX Runtime Web backends
+    const rawTensorData =
+      typeof outputTensor.getData === 'function'
+        ? await outputTensor.getData()
+        : outputTensor.data;
+
+    const rawData =
+      rawTensorData instanceof Float32Array
+        ? rawTensorData
+        : new Float32Array(rawTensorData as ArrayLike<number>);
+
     const dims = outputTensor.dims;
 
     this.cachedRawOutput = {
@@ -289,10 +282,6 @@ class FoodInferenceEngine {
     );
   }
 
-  /**
-   * Re-decodes the cached output tensor instantaneously when the user adjusts
-   * confidence threshold, IoU threshold, or category filter mode.
-   */
   public decodeCachedOutput(
     profile: ModelProfile,
     confidenceThreshold: number,
@@ -307,7 +296,6 @@ class FoodInferenceEngine {
     const numModelClasses = dims[1] - 4;
 
     let allowedClassIds: Set<number> | null = null;
-    // Only apply COCO subset filtering if the loaded model actually has 80 classes
     if (numModelClasses === 80) {
       if (filterMode === 'food_only') {
         allowedClassIds = new Set(profile.coreFoodClassIds);
