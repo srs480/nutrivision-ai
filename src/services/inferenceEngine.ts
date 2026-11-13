@@ -1,18 +1,36 @@
-import * as ort from 'onnxruntime-web';
+import type * as OrtType from 'onnxruntime-web';
 import {
   LetterboxMetadata,
   ModelProfile,
   RawDetection,
 } from '../types/detection';
-import { getCachedModelBuffer, saveCachedModelBuffer } from './modelCache';
+import {
+  clearModelCache,
+  getCachedModelBuffer,
+  saveCachedModelBuffer,
+} from './modelCache';
 import { preprocessImageForYolo } from '../utils/imagePipeline';
 import { applyNonMaxSuppression, decodeYoloV8Output } from '../utils/nms';
 
-// Configure WASM runtime binary delivery via CDN matching the exact installed onnxruntime-web version
-ort.env.wasm.wasmPaths =
-  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/';
-ort.env.wasm.numThreads = 1;
-ort.env.wasm.simd = true;
+declare global {
+  interface Window {
+    ort?: typeof OrtType;
+  }
+}
+
+function getOrtRuntime(): typeof OrtType {
+  const ort = window.ort;
+  if (!ort) {
+    throw new Error(
+      'ONNX Runtime Web global script not loaded. Please check index.html.'
+    );
+  }
+  ort.env.wasm.wasmPaths =
+    'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/';
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.simd = true;
+  return ort;
+}
 
 export interface InferenceResult {
   rawUnfilteredCount: number;
@@ -24,7 +42,7 @@ export interface InferenceResult {
 }
 
 class FoodInferenceEngine {
-  private session: ort.InferenceSession | null = null;
+  private session: OrtType.InferenceSession | null = null;
   private activeProfileId: string | null = null;
   private activeBackend: 'webgpu' | 'wasm' = 'wasm';
   private cachedRawOutput: {
@@ -43,11 +61,13 @@ class FoodInferenceEngine {
   }
 
   /**
-   * Validates whether an ArrayBuffer is a genuine ONNX protobuf binary
-   * rather than an HTML 404 fallback page or JSON error response.
+   * Checks that the downloaded binary is at least 4 MB (real YOLOv8n ONNX is ~12.2 MB)
+   * and is not an HTML/JSON/Git-LFS text file.
    */
   private isValidOnnxBuffer(buffer: ArrayBuffer): boolean {
-    if (buffer.byteLength < 100000) return false; // YOLOv8n is ~12MB; anything <100KB is invalid
+    if (!buffer || buffer.byteLength < 4 * 1024 * 1024) {
+      return false;
+    }
     const headerBytes = new Uint8Array(buffer, 0, 32);
     const textPrefix = new TextDecoder()
       .decode(headerBytes)
@@ -68,21 +88,16 @@ class FoodInferenceEngine {
     url: string,
     onProgress?: (progressPct: number, loadedMb: number) => void
   ): Promise<ArrayBuffer> {
-    const response = await fetch(url, { mode: 'cors' });
+    const response = await fetch(url, { mode: 'cors', cache: 'force-cache' });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} while fetching ${url}`);
-    }
-
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('text/html') || contentType.includes('application/json')) {
-      throw new Error(`URL ${url} did not return a binary ONNX file.`);
     }
 
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (!response.body) {
       const buf = await response.arrayBuffer();
       if (!this.isValidOnnxBuffer(buf)) {
-        throw new Error('Downloaded file is not a valid ONNX model binary.');
+        throw new Error(`Invalid ONNX binary from ${url}`);
       }
       return buf;
     }
@@ -116,7 +131,7 @@ class FoodInferenceEngine {
 
     const buffer = combined.buffer;
     if (!this.isValidOnnxBuffer(buffer)) {
-      throw new Error('Fetched resource is not a valid ONNX protobuf binary.');
+      throw new Error(`Resource from ${url} is smaller than 4MB or not a valid ONNX file.`);
     }
 
     return buffer;
@@ -131,48 +146,61 @@ class FoodInferenceEngine {
     }
 
     this.cachedRawOutput = null;
-    onProgress?.('Checking local browser IndexedDB cache...', 10);
+    onProgress?.('Checking local browser cache...', 10);
 
     let modelBuffer = await getCachedModelBuffer(profile.id);
     let loadedSource = 'IndexedDB Cache';
 
-    if (!modelBuffer || !this.isValidOnnxBuffer(modelBuffer)) {
-      modelBuffer = null;
-      const candidateUrls = [profile.localPath, ...profile.fallbackUrls];
-      let lastError: Error | null = null;
-
-      for (const url of candidateUrls) {
-        try {
-          onProgress?.(`Downloading model weights (${url})...`, 20);
-          modelBuffer = await this.fetchWithProgress(url, (pct, mb) => {
-            onProgress?.(
-              `Downloading ONNX weights (${mb} MB)...`,
-              Math.max(20, Math.min(85, pct))
-            );
-          });
-          loadedSource = url.startsWith('/')
-            ? `Local Asset (${url})`
-            : 'Public ONNX Mirror';
-          break;
-        } catch (err) {
-          lastError = err instanceof Error ? err : new Error(String(err));
-        }
+    if (modelBuffer && this.isValidOnnxBuffer(modelBuffer)) {
+      try {
+        onProgress?.('Initializing cached ONNX session...', 90);
+        const { session, backend } = await this.createSessionSafely(modelBuffer);
+        this.session = session;
+        this.activeProfileId = profile.id;
+        this.activeBackend = backend;
+        onProgress?.('Model ready', 100);
+        return { backend, source: loadedSource };
+      } catch {
+        // Cached buffer was corrupted; clear cache and re-download
+        await clearModelCache();
+        modelBuffer = null;
       }
-
-      if (!modelBuffer) {
-        throw new Error(
-          `Could not load ONNX model "${profile.name}". ${
-            lastError?.message || ''
-          }`
-        );
-      }
-
-      onProgress?.('Caching model in IndexedDB for offline reuse...', 88);
-      await saveCachedModelBuffer(profile.id, modelBuffer);
     }
 
-    onProgress?.('Initializing ONNX Runtime Web session...', 92);
+    const candidateUrls = [profile.localPath, ...profile.fallbackUrls];
+    let lastError: Error | null = null;
+
+    for (const url of candidateUrls) {
+      try {
+        onProgress?.(`Downloading ONNX model weights...`, 20);
+        modelBuffer = await this.fetchWithProgress(url, (pct, mb) => {
+          onProgress?.(
+            `Downloading ONNX weights (${mb} MB)...`,
+            Math.max(20, Math.min(85, pct))
+          );
+        });
+        loadedSource = url.startsWith('/')
+          ? `Local Asset (${url})`
+          : 'Public ONNX Mirror';
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
+    if (!modelBuffer) {
+      throw new Error(
+        `Could not download ONNX model "${profile.name}". ${
+          lastError?.message || ''
+        }`
+      );
+    }
+
+    onProgress?.('Initializing ONNX Runtime Web WASM engine...', 92);
     const { session, backend } = await this.createSessionSafely(modelBuffer);
+
+    onProgress?.('Caching verified model in browser...', 97);
+    await saveCachedModelBuffer(profile.id, modelBuffer);
 
     this.session = session;
     this.activeProfileId = profile.id;
@@ -187,8 +215,8 @@ class FoodInferenceEngine {
     profileId: string
   ): Promise<{ backend: 'webgpu' | 'wasm' }> {
     const buffer = await file.arrayBuffer();
-    if (!this.isValidOnnxBuffer(buffer)) {
-      throw new Error('Selected file is not a valid ONNX model binary.');
+    if (buffer.byteLength < 100 * 1024) {
+      throw new Error('Selected file is too small to be a valid YOLO ONNX model.');
     }
 
     const { session, backend } = await this.createSessionSafely(buffer);
@@ -201,18 +229,15 @@ class FoodInferenceEngine {
     return { backend };
   }
 
-  /**
-   * Passes a clean Uint8Array copy to ONNX Runtime Web using the stable WASM SIMD backend
-   * to prevent protobuf/tensor `t.getValue is not a function` errors across browsers.
-   */
   private async createSessionSafely(
     modelBuffer: ArrayBuffer
-  ): Promise<{ session: ort.InferenceSession; backend: 'webgpu' | 'wasm' }> {
+  ): Promise<{ session: OrtType.InferenceSession; backend: 'webgpu' | 'wasm' }> {
+    const ort = getOrtRuntime();
     const modelBytes = new Uint8Array(modelBuffer.slice(0));
 
     const session = await ort.InferenceSession.create(modelBytes, {
       executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
+      graphOptimizationLevel: 'basic',
     });
 
     return { session, backend: 'wasm' };
@@ -229,6 +254,7 @@ class FoodInferenceEngine {
       throw new Error('ONNX InferenceSession is not initialized.');
     }
 
+    const ort = getOrtRuntime();
     const { tensorData, metadata } = preprocessImageForYolo(
       image,
       profile.inputSize
@@ -243,7 +269,7 @@ class FoodInferenceEngine {
     ]);
 
     const t0 = performance.now();
-    const feeds: Record<string, ort.Tensor> = { [inputName]: inputTensor };
+    const feeds: Record<string, OrtType.Tensor> = { [inputName]: inputTensor };
     const outputMap = await this.session.run(feeds);
     const inferenceTimeMs = Math.round(performance.now() - t0);
 
@@ -254,16 +280,10 @@ class FoodInferenceEngine {
       throw new Error('Model returned an empty output tensor.');
     }
 
-    // Safely extract tensor data across both sync and async ONNX Runtime Web backends
-    const rawTensorData =
-      typeof outputTensor.getData === 'function'
-        ? await outputTensor.getData()
-        : outputTensor.data;
-
     const rawData =
-      rawTensorData instanceof Float32Array
-        ? rawTensorData
-        : new Float32Array(rawTensorData as ArrayLike<number>);
+      outputTensor.data instanceof Float32Array
+        ? outputTensor.data
+        : new Float32Array(outputTensor.data as ArrayLike<number>);
 
     const dims = outputTensor.dims;
 
